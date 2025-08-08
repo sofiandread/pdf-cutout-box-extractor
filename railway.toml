@@ -1,0 +1,2 @@
+[deploy]
+apt_packages = ["libgl1"]
