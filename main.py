@@ -205,11 +205,11 @@ def root():
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
-    # Keep POST field name 'data' for n8n compatibility
-    if 'data' not in request.files:
-        return jsonify({"error": "No file part 'data' in request"}), 400
+    # Keep POST field name 'pdf' for n8n compatibility
+    if 'pdf' not in request.files:
+        return jsonify({"error": "No file part 'pdf' in request"}), 400
 
-    f = request.files['data']
+    f = request.files['pdf']
     pdf_bytes = f.read()
 
     try:
