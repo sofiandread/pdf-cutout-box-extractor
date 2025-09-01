@@ -200,32 +200,34 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
 
 # ---- Background removal & trim helpers ----
 
-def inches_to_px(inches: float, dpi: int) -> int:
-    return int(round(inches * dpi))
-
-
-def _compute_border_lab_stats(rgb: np.ndarray, border_frac: float = 0.0125):
-    """Return median Lab color of the border strip."""
+def _border_kmeans_centers_lab(rgb: np.ndarray, k: int = 3, border_frac: float = 0.0125) -> np.ndarray:
+    """
+    Run K-means on BORDER pixels only (captures page white + demo-box color).
+    Returns cluster centers in Lab (float32, shape (k,3)).
+    """
     H, W, _ = rgb.shape
     bw = max(2, int(round(min(H, W) * border_frac)))
-    border = np.zeros((H, W), dtype=bool)
-    border[:bw, :] = True
-    border[-bw:, :] = True
-    border[:, :bw] = True
-    border[:, -bw:] = True
+    border_mask = np.zeros((H, W), dtype=bool)
+    border_mask[:bw, :] = True;  border_mask[-bw:, :] = True
+    border_mask[:, :bw] = True;  border_mask[:, -bw:] = True
 
-    border_rgb = rgb[border].astype(np.uint8)
+    border_rgb = rgb[border_mask]
     if border_rgb.size == 0:
-        # fallback: use entire image (shouldn't happen)
-        border_rgb = rgb.reshape(-1, 3).astype(np.uint8)
+        # Fallback: use whole image (shouldn't happen)
+        border_rgb = rgb.reshape(-1, 3)
 
-    border_lab = cv2.cvtColor(border_rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
-    med = np.median(border_lab, axis=0).astype(np.float32)
-    return med  # Lab median
+    sample = border_rgb.astype(np.uint8).reshape(-1, 1, 3)
+    border_lab = cv2.cvtColor(sample, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+
+    # Clamp k to available samples
+    k = max(1, min(k, len(border_lab)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    compactness, labels, centers = cv2.kmeans(border_lab, k, None, criteria, 6, cv2.KMEANS_PP_CENTERS)
+    return centers.astype(np.float32)
 
 
 def _keep_only_border_connected(mask: np.ndarray) -> np.ndarray:
-    """Keep only components that touch any border."""
+    """Keep only components of 'mask' that touch the image border."""
     H, W = mask.shape
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
     if num <= 1:
@@ -240,10 +242,15 @@ def remove_background_box_from_crop_rgba(
     crop_rgba: Image.Image,
     lab_tolerance: float = 12.0,
     dilate_px: int = 1,
+    border_k: int = 3
 ) -> Tuple[Image.Image, np.ndarray]:
     """
-    Estimate bg from border pixels (Lab median), make those pixels transparent
-    wherever ΔE(Lab) <= lab_tolerance and the region touches the border.
+    Color-agnostic box removal:
+      1) K-means on BORDER pixels to get all border colors (page + box).
+      2) Mark as background any pixel whose Lab distance to ANY border center <= lab_tolerance.
+      3) Keep only border-connected bg, dilate slightly (anti-alias).
+      4) Set bg alpha = 0.
+    Returns (clean_rgba, bg_mask).
     """
     if crop_rgba.mode != "RGBA":
         crop_rgba = crop_rgba.convert("RGBA")
@@ -251,43 +258,37 @@ def remove_background_box_from_crop_rgba(
     rgb = arr[:, :, :3].astype(np.uint8)
     H, W = rgb.shape[:2]
 
-    # Full Lab image
+    # Full image in Lab
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-    # Border Lab median = background color proxy
-    bg_lab = _compute_border_lab_stats(rgb, border_frac=0.0125)[None, None, :]  # (1,1,3)
+    # Centers from border only (captures both page white and demo-box fill)
+    centers_lab = _border_kmeans_centers_lab(rgb, k=border_k, border_frac=0.0125)  # (k,3)
 
-    # ΔE ~= Euclidean in Lab (good enough here)
-    d2 = np.sum((lab - bg_lab) ** 2, axis=2)
-    d = np.sqrt(d2)
+    # Build bg mask: near ANY border center
+    bg_mask = np.zeros((H, W), dtype=bool)
+    for center in centers_lab:
+        c = center[None, None, :]  # (1,1,3)
+        d2 = np.sum((lab - c) ** 2, axis=2)
+        d = np.sqrt(d2)
+        bg_mask |= (d <= lab_tolerance)
 
-    # Background candidate: close to border color
-    bg_mask = (d <= lab_tolerance)
-
-    # Keep only border-connected parts
+    # Only keep border-connected bg (won't nuke internal white shapes)
     bg_mask = _keep_only_border_connected(bg_mask)
 
-    # Dilate slightly to swallow anti-aliased rims
+    # Grow a hair to swallow anti-aliased rims
     if dilate_px > 0:
         kernel = np.ones((dilate_px, dilate_px), np.uint8)
         bg_mask = cv2.dilate(bg_mask.astype(np.uint8), kernel, 1).astype(bool)
 
-    # Apply transparency
     out = arr.copy()
-    out[bg_mask, 3] = 0
-
+    out[bg_mask, 3] = 0  # make background fully transparent
     return Image.fromarray(out, mode="RGBA"), bg_mask
-
 
 def trim_transparent_margin(
     rgba_img: Image.Image,
     min_alpha: int = 8,
     pad_px: int = 4
 ) -> Tuple[Image.Image, int, int, int, int]:
-    """
-    Crop away near-transparent margins.
-    Returns (trimmed, x0, y0, x1, y1) in local (crop) coordinates.
-    """
     if rgba_img.mode != "RGBA":
         rgba_img = rgba_img.convert("RGBA")
     arr = np.array(rgba_img)
@@ -301,14 +302,13 @@ def trim_transparent_margin(
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
 
-    # padding
-    y0 = max(0, y0 - pad_px)
-    x0 = max(0, x0 - pad_px)
+    y0 = max(0, y0 - pad_px); x0 = max(0, x0 - pad_px)
     y1 = min(alpha.shape[0], y1 + pad_px)
     x1 = min(alpha.shape[1], x1 + pad_px)
 
     arr = arr[y0:y1, x0:x1, :]
     return Image.fromarray(arr, mode="RGBA"), x0, y0, x1, y1
+
 
 
 # ---- Routes ----
@@ -417,15 +417,17 @@ def extract_art_no_box():
 
         # 2) remove background using border Lab color
         cleaned_rgba, bg_mask = remove_background_box_from_crop_rgba(
-            crop_rgba,
-            lab_tolerance=lab_tolerance,
-            dilate_px=dilate_px
-        )
+    crop_rgba,
+    lab_tolerance=float(request.values.get("lab_tolerance", 12.0)),
+    dilate_px=int(request.values.get("dilate_px", 1)),
+    border_k=int(request.values.get("border_k", 3))
+)
 
-        # 3) trim transparent margins with padding
-        trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
-            cleaned_rgba, min_alpha=min_alpha, pad_px=pad_px
-        )
+trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
+    cleaned_rgba,
+    min_alpha=int(request.values.get("min_alpha", 8)),
+    pad_px=int(request.values.get("pad_px", 4))
+)
 
         # Page-relative bbox of the returned art
         art_x = int(x + x0_rel)
