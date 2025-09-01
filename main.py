@@ -418,7 +418,7 @@ def crop_art_tight():
         out.save(os.path.join(STATIC_DIR, out_name), format="PNG")
 
         debug_urls = {}
-        if DEBUG_SAVE && save_debug:
+        if DEBUG_SAVE and save_debug:
             # Rebuild the mask image for inspection
             rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
             lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
