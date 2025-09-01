@@ -15,7 +15,6 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 DEBUG_SAVE = True
 RENDER_DPI = int(os.getenv("RENDER_DPI", "300"))  # Higher DPI helps detection
 
-# Railway typically runs the app as `python main.py` or via a Procfile. Keep module name `main`.
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 
 
@@ -24,7 +23,6 @@ def _ts() -> str:
 
 
 def pil_to_cv2(im: Image.Image) -> np.ndarray:
-    """PIL RGB/RGBA -> OpenCV BGR/BGRA"""
     arr = np.array(im)
     if arr.ndim == 2:
         return arr
@@ -36,7 +34,6 @@ def pil_to_cv2(im: Image.Image) -> np.ndarray:
 
 
 def cv2_to_pil(arr: np.ndarray) -> Image.Image:
-    """OpenCV BGR/BGRA -> PIL RGB/RGBA"""
     if arr.ndim == 2:
         return Image.fromarray(arr)
     if arr.shape[2] == 3:
@@ -78,7 +75,6 @@ def approx_is_quadrilateral(cnt: np.ndarray, eps_ratio: float = 0.02) -> Tuple[b
 
 
 def angles_are_near_right(quad: np.ndarray, cos_thresh: float = 0.3) -> bool:
-    # cos(90deg) ~ 0. For robustness allow |cos| <= cos_thresh (0..1)
     pts = quad.reshape(-1, 2)
 
     def angle_cos(p0, p1, p2):
@@ -117,30 +113,21 @@ def suppress_nested_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return kept
 
 
-# ---- Detection (demo box) ----
+# ---- Detect the big demo box ----
 
 def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     H, W = bgr.shape[:2]
-
-    # 1) Preprocess
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)  # normalize contrast
-    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # 2) Edge detection (auto thresholds from median)
-    v = np.median(gray_blur)
+    gray = cv2.equalizeHist(gray)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    v = np.median(blur)
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
-    edges = cv2.Canny(gray_blur, lower, upper)
-
-    # 3) Morphology to close gaps in rectangle borders
+    edges = cv2.Canny(blur, lower, upper)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # 4) Find contours
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 5) Filter contours by size/shape
     page_area = W * H
     boxes = []
     for c in cnts:
@@ -163,7 +150,6 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
             continue
         boxes.append((x, y, w, h))
 
-    # Fallback path
     if not boxes:
         thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                     cv2.THRESH_BINARY_INV, 41, 8)
@@ -191,7 +177,6 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
 
     if not boxes:
         return []
-
     boxes = suppress_nested_boxes(boxes)
     boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
     return boxes
@@ -207,48 +192,78 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
-# ---- Tight-crop logic (NO color changes) ----
+# ---- Foreground mask for tight crop (background-agnostic) ----
 
-def _tight_bbox_union_mask(gray: np.ndarray,
-                           ignore_border_px: int,
-                           min_area: int,
-                           dilate_px: int = 1) -> Tuple[int, int, int, int]:
+def _interior_median_lab(rgb: np.ndarray, frac: float = 0.06) -> np.ndarray:
+    H, W, _ = rgb.shape
+    m = max(2, int(round(min(H, W) * frac)))
+    inner = rgb[m:H - m, m:W - m, :]
+    if inner.size == 0:
+        inner = rgb
+    lab = cv2.cvtColor(inner, cv2.COLOR_RGB2LAB).astype(np.float32)
+    med = np.median(lab.reshape(-1, 3), axis=0).astype(np.float32)
+    return med[None, None, :]  # (1,1,3)
+
+
+def _build_union_mask(crop_bgr: np.ndarray,
+                      border_strip_px: int,
+                      min_area: int,
+                      dilate_px: int = 1,
+                      deltaE_thresh: float = 10.0) -> np.ndarray:
     """
-    Build a foreground mask from the UNION of:
-      - Adaptive threshold
-      - Otsu threshold
-      - Canny edges
-    Then compute the minimal bounding rectangle around that mask.
+    Returns a binary mask (uint8 0/255) where 255 = foreground.
+    Union of:
+      - adaptive binary (inv + normal)
+      - Otsu (inv + normal)
+      - Canny edges (dilated)
+      - Lab ΔE from interior background (>= threshold)
+    Then strips a thin inner band so the big framing box never counts, removes tiny blobs.
     """
-    H, W = gray.shape[:2]
+    H, W = crop_bgr.shape[:2]
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Adaptive (handles gradients/unknown bg color)
+    # Adaptive
     block = 51 if 51 % 2 == 1 else 53
+    adap_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, block, 10)
     adap = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY, block, 10)
 
-    # Otsu (global)
+    # Otsu
     _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Canny edges
+    # Canny edges (thickened)
     v = np.median(blur)
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
     edges = cv2.Canny(blur, lower, upper)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), 1)
 
-    # Union -> foreground
-    mask = cv2.bitwise_or(adap, otsu)
+    # ΔE from interior background
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    bg_lab = _interior_median_lab(rgb, frac=0.06)  # (1,1,3)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    dE = np.linalg.norm(lab - bg_lab, axis=2)
+    delta_mask = (dE >= deltaE_thresh).astype(np.uint8) * 255
+
+    # Union where white = foreground
+    mask = cv2.bitwise_or(adap_inv, otsu_inv)
     mask = cv2.bitwise_or(mask, edges)
+    mask = cv2.bitwise_or(mask, adap)
+    mask = cv2.bitwise_or(mask, otsu)
+    mask = cv2.bitwise_or(mask, delta_mask)
 
-    # Ignore inner band so the big framing box doesn't count
-    b = max(2, int(ignore_border_px))
+    # Strip inner band to avoid counting the framing box edges
+    b = max(2, int(border_strip_px))
     mask[:b, :] = 0
     mask[-b:, :] = 0
     mask[:, :b] = 0
     mask[:, -b:] = 0
 
-    # Clean + connect
+    # Clean up
     if dilate_px > 0:
         kernel = np.ones((dilate_px, dilate_px), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -261,14 +276,14 @@ def _tight_bbox_union_mask(gray: np.ndarray,
         if area >= min_area:
             keep[labels == i] = 255
 
-    if np.count_nonzero(keep) == 0:
-        # fallback: edges only (already border-cleansed)
-        if np.count_nonzero(edges) == 0:
-            return 0, 0, W, H
-        ys, xs = np.where(edges > 0)
-    else:
-        ys, xs = np.where(keep > 0)
+    return keep
 
+
+def _tight_bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    H, W = mask.shape[:2]
+    if np.count_nonzero(mask) == 0:
+        return 0, 0, W, H
+    ys, xs = np.where(mask > 0)
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     return x0, y0, x1, y1
@@ -283,7 +298,6 @@ def root():
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
-    # Keep POST field name 'pdf' for n8n compatibility
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
 
@@ -296,7 +310,7 @@ def detect_art_format():
         return jsonify({"error": f"Failed to render PDF: {str(e)}"}), 400
 
     bgr = pil_to_cv2(pil_img)
-    boxes = detect_design_boxes_bgr(bgr)  # ALL big boxes
+    boxes = detect_design_boxes_bgr(bgr)
 
     overlay_bgr = draw_debug_overlay(bgr, boxes)
     debug_name = f"debug_{_ts()}.png"
@@ -311,18 +325,13 @@ def detect_art_format():
         crop_img.save(os.path.join(STATIC_DIR, crop_name), format="PNG")
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{crop_name}",
-            "x": int(x),
-            "y": int(y),
-            "width": int(w),
-            "height": int(h),
-            "page": 1
+            "x": int(x), "y": int(y), "width": int(w), "height": int(h), "page": 1
         })
 
-    response = {
+    return jsonify({
         "cutouts": results,
         "debug_overlay_url": f"{request.host_url.rstrip('/')}/static/{debug_name}",
-    }
-    return jsonify(response), 200
+    }), 200
 
 
 # Simple pass-through (kept for compatibility)
@@ -354,32 +363,33 @@ def extract_art_no_box():
     return jsonify({"art_no_box": results}), 200
 
 
-# NEW: tight crop endpoint (primary one to use)
+# NEW: tight crop endpoint (primary)
 @app.route("/crop-art-tight", methods=["POST"])
 def crop_art_tight():
     """
-    Tight-crop the PDF so that the returned PNG bounds match the artwork bounds.
+    Tight-crop to the minimal rectangle enclosing all visible artwork inside the big demo box.
     NO color edits; only cropping.
 
     Optional params (form or query):
-      - border_strip_frac (float, default 0.02): ignore this inner band of the crop
-      - min_area_frac (float, default 0.0003): min component area to keep
-      - dilate_px (int, default 1): connect small gaps
-      - pad_px (int, default 2): pad the final crop (pixels)
-      - save_debug (0/1): saves union-mask used for the bbox
+      - border_strip_frac (float, default 0.02): inner band to ignore (avoid counting the frame)
+      - min_area_frac (float, default 0.0003): drop tiny components below this fraction of crop area
+      - dilate_px (int, default 1): connect small gaps in the union mask
+      - pad_px (int, default 2): padding added after the tight bbox
+      - deltaE_thresh (float, default 10.0): Lab distance for bg-difference mask
+      - save_debug (0/1): if 1, saves the union mask used
     """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
 
-    # Params
+    f = request.files['pdf']
+    pdf_bytes = f.read()
+
     border_strip_frac = float(request.values.get("border_strip_frac", 0.02))
     min_area_frac = float(request.values.get("min_area_frac", 0.0003))
     dilate_px = int(request.values.get("dilate_px", 1))
     pad_px = int(request.values.get("pad_px", 2))
+    deltaE_thresh = float(request.values.get("deltaE_thresh", 10.0))
     save_debug = str(request.values.get("save_debug", "0")) == "1"
-
-    f = request.files['pdf']
-    pdf_bytes = f.read()
 
     try:
         pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI)
@@ -392,18 +402,23 @@ def crop_art_tight():
         return jsonify({"error": "No design box found"}), 404
 
     results: List[Dict] = []
-    for i, (x, y, w, h) in enumerate(boxes):
-        crop = bgr[y:y+h, x:x+w].copy()
-        Hc, Wc = crop.shape[:2]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
 
-        ignore_border_px = max(2, int(round(min(Hc, Wc) * border_strip_frac)))
+    for i, (x, y, w, h) in enumerate(boxes):
+        crop = bgr[y:y + h, x:x + w].copy()
+        Hc, Wc = crop.shape[:2]
+
+        ignore_px = max(2, int(round(min(Hc, Wc) * border_strip_frac)))
         min_area = int(round(min_area_frac * Hc * Wc))
 
-        x0r, y0r, x1r, y1r = _tight_bbox_union_mask(
-            gray, ignore_border_px=ignore_border_px, min_area=min_area, dilate_px=dilate_px
+        mask = _build_union_mask(
+            crop,
+            border_strip_px=ignore_px,
+            min_area=min_area,
+            dilate_px=dilate_px,
+            deltaE_thresh=deltaE_thresh
         )
+
+        x0r, y0r, x1r, y1r = _tight_bbox_from_mask(mask)
 
         # Add padding within bounds
         x0 = max(0, x0r - pad_px)
@@ -411,29 +426,13 @@ def crop_art_tight():
         x1 = min(Wc, x1r + pad_px)
         y1 = min(Hc, y1r + pad_px)
 
-        art_x, art_y = int(x + x0), int(y + y0)
-        art_w, art_h = int(x1 - x0), int(y1 - y0)
-
+        # Save tightly cropped **original pixels**
         tight = cv2_to_pil(crop[y0:y1, x0:x1])
         out_name = f"art_tight_{_ts()}_{i+1}.png"
         tight.save(os.path.join(STATIC_DIR, out_name), format="PNG")
 
         debug_urls = {}
         if DEBUG_SAVE and save_debug:
-            # Recreate union mask for inspection
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            block = 51 if 51 % 2 == 1 else 53
-            adap = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, block, 10)
-            _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            v = np.median(blur); lower = int(max(0, 0.66*v)); upper = int(min(255, 1.33*v))
-            edges = cv2.Canny(blur, lower, upper)
-            mask = cv2.bitwise_or(cv2.bitwise_or(adap, otsu), edges)
-            b = ignore_border_px
-            mask[:b, :] = 0; mask[-b:, :] = 0; mask[:, :b] = 0; mask[:, -b:] = 0
-            if dilate_px > 0:
-                kernel = np.ones((dilate_px, dilate_px), np.uint8)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
             mname = f"dbg_unionmask_{_ts()}_{i+1}.png"
             cv2.imwrite(os.path.join(STATIC_DIR, mname), mask)
             debug_urls = {"mask_url": f"{request.host_url.rstrip('/')}/static/{mname}"}
@@ -441,13 +440,15 @@ def crop_art_tight():
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
             "page": 1,
-            "x": art_x, "y": art_y, "width": art_w, "height": art_h,
+            "x": int(x + x0), "y": int(y + y0),
+            "width": int(x1 - x0), "height": int(y1 - y0),
             "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
             "params": {
                 "border_strip_frac": border_strip_frac,
                 "min_area_frac": min_area_frac,
                 "dilate_px": dilate_px,
                 "pad_px": pad_px,
+                "deltaE_thresh": deltaE_thresh,
                 "dpi": RENDER_DPI
             },
             **({"debug": debug_urls} if debug_urls else {})
