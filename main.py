@@ -25,7 +25,6 @@ def _ts() -> str:
 
 
 def pil_to_cv2(im: Image.Image) -> np.ndarray:
-    """PIL RGB -> OpenCV BGR (keeps 3 channels)"""
     arr = np.array(im)
     if arr.ndim == 2:
         return arr
@@ -33,7 +32,6 @@ def pil_to_cv2(im: Image.Image) -> np.ndarray:
 
 
 def cv2_to_pil(arr: np.ndarray) -> Image.Image:
-    """OpenCV BGR -> PIL RGB"""
     if arr.ndim == 2:
         return Image.fromarray(arr)
     return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
@@ -200,130 +198,76 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
-# ---- Helpers for background removal and trimming ----
+# ---- Background removal & trim helpers ----
 
 def inches_to_px(inches: float, dpi: int) -> int:
     return int(round(inches * dpi))
 
 
-def _kmeans_centers_lab(rgb: np.ndarray, k: int = 3, sample_step: int = 4) -> np.ndarray:
-    """
-    Fast color clustering using OpenCV kmeans (no sklearn).
-    Returns cluster centers in LAB (float32, shape (k,3)).
-    """
-    h, w, _ = rgb.shape
-    # Subsample to speed up
-    sampled = rgb[::sample_step, ::sample_step, :].reshape(-1, 3).astype(np.float32)
-    if sampled.shape[0] < k:
-        k = max(1, sampled.shape[0])
-    # Convert to LAB for perceptual distance
-    sampled_lab = cv2.cvtColor(sampled.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+def _compute_border_lab_stats(rgb: np.ndarray, border_frac: float = 0.0125):
+    """Return median Lab color of the border strip."""
+    H, W, _ = rgb.shape
+    bw = max(2, int(round(min(H, W) * border_frac)))
+    border = np.zeros((H, W), dtype=bool)
+    border[:bw, :] = True
+    border[-bw:, :] = True
+    border[:, :bw] = True
+    border[:, -bw:] = True
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
-    compactness, labels, centers = cv2.kmeans(sampled_lab, k, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
-    return centers.astype(np.float32)
+    border_rgb = rgb[border].astype(np.uint8)
+    if border_rgb.size == 0:
+        # fallback: use entire image (shouldn't happen)
+        border_rgb = rgb.reshape(-1, 3).astype(np.uint8)
 
-
-def _label_by_nearest_center_lab(lab_img: np.ndarray, centers_lab: np.ndarray) -> np.ndarray:
-    """
-    Assign each pixel the index of the nearest LAB center. Returns label image (H,W).
-    """
-    # lab_img: HxWx3 float32
-    H, W, _ = lab_img.shape
-    C = centers_lab.shape[0]
-    # Compute squared distance to each center efficiently
-    lab_ = lab_img.reshape(-1, 3)[:, None, :]  # (N,1,3)
-    centers_ = centers_lab[None, :, :]         # (1,C,3)
-    d2 = np.sum((lab_ - centers_) ** 2, axis=2)  # (N,C)
-    labels = np.argmin(d2, axis=1).astype(np.int32)
-    return labels.reshape(H, W)
-
-
-def _find_background_centers_from_border(labels: np.ndarray, centers_lab: np.ndarray, border_frac_thresh: float = 0.15) -> List[int]:
-    """
-    Identify which clusters are background by checking which labels dominate on the border.
-    """
-    H, W = labels.shape
-    bw = max(2, min(H, W) // 100)  # thin border strip ~1%
-    border_mask = np.zeros_like(labels, dtype=bool)
-    border_mask[:bw, :] = True
-    border_mask[-bw:, :] = True
-    border_mask[:, :bw] = True
-    border_mask[:, -bw:] = True
-
-    border_labels = labels[border_mask]
-    bg_labels, counts = np.unique(border_labels, return_counts=True)
-
-    # Choose any cluster that covers >= border_frac_thresh of border pixels
-    total = border_labels.size
-    bg = [int(l) for l, c in zip(bg_labels, counts) if c / float(total) >= border_frac_thresh]
-    # Fallback: at least take the most common border label
-    if not bg and bg_labels.size > 0:
-        bg = [int(bg_labels[np.argmax(counts)])]
-    return bg
+    border_lab = cv2.cvtColor(border_rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    med = np.median(border_lab, axis=0).astype(np.float32)
+    return med  # Lab median
 
 
 def _keep_only_border_connected(mask: np.ndarray) -> np.ndarray:
-    """
-    Keep only the components of 'mask' that touch the image border.
-    """
+    """Keep only components that touch any border."""
     H, W = mask.shape
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
     if num <= 1:
         return mask.astype(bool)
-
-    border_touching = set()
-    # Any component ID that appears on the border?
     border_ids = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) | \
                  set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
-    border_touching |= border_ids
-
-    keep = np.isin(labels, list(border_touching))
+    keep = np.isin(labels, list(border_ids))
     return keep
 
 
 def remove_background_box_from_crop_rgba(
     crop_rgba: Image.Image,
     lab_tolerance: float = 12.0,
-    k_colors: int = 3,
-    dilate_px: int = 1
+    dilate_px: int = 1,
 ) -> Tuple[Image.Image, np.ndarray]:
     """
-    Remove the large background (demo box + any page white corners) from a crop.
-    - Uses color clustering in LAB, labels the whole image by nearest centers.
-    - Marks clusters that dominate the border as background.
-    - Optionally dilates the bg mask to clean anti-aliased edges.
-    Returns (clean_rgba_image, bg_mask_bool_array)
+    Estimate bg from border pixels (Lab median), make those pixels transparent
+    wherever ΔE(Lab) <= lab_tolerance and the region touches the border.
     """
     if crop_rgba.mode != "RGBA":
         crop_rgba = crop_rgba.convert("RGBA")
     arr = np.array(crop_rgba)
-    rgb = arr[:, :, :3]
+    rgb = arr[:, :, :3].astype(np.uint8)
     H, W = rgb.shape[:2]
 
-    # Full LAB image (float32)
-    lab = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    # Full Lab image
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-    # Cluster colors (centers in LAB)
-    centers_lab = _kmeans_centers_lab(rgb, k=k_colors, sample_step=max(1, min(H, W) // 400 or 1))
+    # Border Lab median = background color proxy
+    bg_lab = _compute_border_lab_stats(rgb, border_frac=0.0125)[None, None, :]  # (1,1,3)
 
-    # Label each pixel by nearest center
-    labels = _label_by_nearest_center_lab(lab, centers_lab)
+    # ΔE ~= Euclidean in Lab (good enough here)
+    d2 = np.sum((lab - bg_lab) ** 2, axis=2)
+    d = np.sqrt(d2)
 
-    # Background centers determined from border dominance
-    bg_centers = _find_background_centers_from_border(labels, centers_lab, border_frac_thresh=0.10)
+    # Background candidate: close to border color
+    bg_mask = (d <= lab_tolerance)
 
-    # Build background candidate mask by LAB distance to each bg center
-    bg_mask = np.zeros((H, W), dtype=bool)
-    for idx in bg_centers:
-        center = centers_lab[idx][None, None, :]  # (1,1,3)
-        d2 = np.sum((lab - center) ** 2, axis=2)
-        bg_mask |= (np.sqrt(d2) <= lab_tolerance)
-
-    # Keep only border-connected bg (avoid nuking internal shapes similar to bg color)
+    # Keep only border-connected parts
     bg_mask = _keep_only_border_connected(bg_mask)
 
-    # Slightly grow mask to swallow anti-aliased edges
+    # Dilate slightly to swallow anti-aliased rims
     if dilate_px > 0:
         kernel = np.ones((dilate_px, dilate_px), np.uint8)
         bg_mask = cv2.dilate(bg_mask.astype(np.uint8), kernel, 1).astype(bool)
@@ -341,8 +285,8 @@ def trim_transparent_margin(
     pad_px: int = 4
 ) -> Tuple[Image.Image, int, int, int, int]:
     """
-    Crops away near-transparent margins.
-    Returns (trimmed_image, x0, y0, x1, y1) where x0,y0.. are coordinates within the input image.
+    Crop away near-transparent margins.
+    Returns (trimmed, x0, y0, x1, y1) in local (crop) coordinates.
     """
     if rgba_img.mode != "RGBA":
         rgba_img = rgba_img.convert("RGBA")
@@ -425,15 +369,15 @@ def detect_art_format():
 def extract_art_no_box():
     """
     Produces transparent PNG(s) of the art with the large background removed,
-    and trims away empty margins.
+    then trims away empty margins.
 
-    Query/body params you can pass (optional):
-      - k_colors (int, default 3): number of color clusters
-      - lab_tolerance (float, default 12.0): LAB distance threshold for bg
-      - dilate_px (int, default 1): grow bg mask to avoid halos
-      - pad_px (int, default 4): pixels of padding after trim
-      - pad_in (float, default None): inches of padding after trim (overrides pad_px if set)
-      - min_alpha (int, default 8): alpha threshold for "empty"
+    Optional params (form or query):
+      - lab_tolerance (float, default 12.0): ΔE(Lab) threshold for bg similarity
+      - dilate_px (int, default 1): grow bg mask to avoid halos (try 2 if fringes)
+      - pad_px (int, default 4): padding after trim
+      - pad_in (float, default None): inches of padding after trim (overrides pad_px)
+      - min_alpha (int, default 8): alpha threshold for "content" during trim
+      - save_debug (0/1): if 1, saves mask previews to /static
     """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
@@ -442,12 +386,13 @@ def extract_art_no_box():
     pdf_bytes = f.read()
 
     # Parse options
-    k_colors = int(request.values.get("k_colors", 3))
     lab_tolerance = float(request.values.get("lab_tolerance", 12.0))
     dilate_px = int(request.values.get("dilate_px", 1))
     pad_px = int(request.values.get("pad_px", 4))
     pad_in = request.values.get("pad_in", None)
     min_alpha = int(request.values.get("min_alpha", 8))
+    save_debug = str(request.values.get("save_debug", "0")) == "1"
+
     if pad_in is not None:
         try:
             pad_px = max(pad_px, inches_to_px(float(pad_in), RENDER_DPI))
@@ -470,11 +415,10 @@ def extract_art_no_box():
         # 1) crop the detected box
         crop_rgba = pil_img.crop((x, y, x + w, y + h))
 
-        # 2) remove background (color-agnostic) and clean edges
+        # 2) remove background using border Lab color
         cleaned_rgba, bg_mask = remove_background_box_from_crop_rgba(
             crop_rgba,
             lab_tolerance=lab_tolerance,
-            k_colors=k_colors,
             dilate_px=dilate_px
         )
 
@@ -483,16 +427,32 @@ def extract_art_no_box():
             cleaned_rgba, min_alpha=min_alpha, pad_px=pad_px
         )
 
-        # Page-relative bbox of trimmed art
+        # Page-relative bbox of the returned art
         art_x = int(x + x0_rel)
         art_y = int(y + y0_rel)
         art_w = int(x1_rel - x0_rel)
         art_h = int(y1_rel - y0_rel)
 
-        # 4) Save
+        # 4) Save outputs
         out_name = f"art_no_box_{_ts()}_{i+1}.png"
         out_path = os.path.join(STATIC_DIR, out_name)
         trimmed_rgba.save(out_path, format="PNG")
+
+        debug_urls = {}
+        if DEBUG_SAVE and save_debug:
+            # Save bg mask preview and intermediate cleaned image
+            mask_vis = (bg_mask.astype(np.uint8) * 255)
+            mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
+            mname = f"dbg_mask_{_ts()}_{i+1}.png"
+            mp = os.path.join(STATIC_DIR, mname)
+            cv2.imwrite(mp, mask_vis)
+            cname = f"dbg_cleaned_{_ts()}_{i+1}.png"
+            cp = os.path.join(STATIC_DIR, cname)
+            cleaned_rgba.save(cp, format="PNG")
+            debug_urls = {
+                "mask_url": f"{request.host_url.rstrip('/')}/static/{mname}",
+                "cleaned_url": f"{request.host_url.rstrip('/')}/static/{cname}"
+            }
 
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
@@ -502,16 +462,15 @@ def extract_art_no_box():
             "y": art_y,
             "width": art_w,
             "height": art_h,
-            # Extra info (optional; useful for debugging)
             "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
             "params": {
-                "k_colors": k_colors,
                 "lab_tolerance": lab_tolerance,
                 "dilate_px": dilate_px,
                 "pad_px": pad_px,
                 "min_alpha": min_alpha,
                 "dpi": RENDER_DPI
-            }
+            },
+            **({"debug": debug_urls} if debug_urls else {})
         })
 
     response = {"art_no_box": results}
