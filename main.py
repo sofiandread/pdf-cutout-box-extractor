@@ -192,83 +192,55 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
-# ---- Foreground mask for tight crop (background-agnostic) ----
+# ---- Tight-crop logic (NO color changes) ----
 
-def _interior_median_lab(rgb: np.ndarray, frac: float = 0.06) -> np.ndarray:
-    H, W, _ = rgb.shape
-    m = max(2, int(round(min(H, W) * frac)))
-    inner = rgb[m:H - m, m:W - m, :]
-    if inner.size == 0:
-        inner = rgb
-    lab = cv2.cvtColor(inner, cv2.COLOR_RGB2LAB).astype(np.float32)
-    med = np.median(lab.reshape(-1, 3), axis=0).astype(np.float32)
-    return med[None, None, :]  # (1,1,3)
-
-
-def _build_union_mask(crop_bgr: np.ndarray,
-                      border_strip_px: int,
-                      min_area: int,
-                      dilate_px: int = 1,
-                      deltaE_thresh: float = 10.0) -> np.ndarray:
+def _build_mask_bgdiff_and_edges(gray: np.ndarray,
+                                 ignore_border_px: int,
+                                 min_area: int,
+                                 dilate_px: int = 1) -> np.ndarray:
     """
-    Returns a binary mask (uint8 0/255) where 255 = foreground.
-    Union of:
-      - adaptive binary (inv + normal)
-      - Otsu (inv + normal)
-      - Canny edges (dilated)
-      - Lab ΔE from interior background (>= threshold)
-    Then strips a thin inner band so the big framing box never counts, removes tiny blobs.
+    Foreground = pixels whose brightness differs from the interior background,
+    OR strong edges. Returns uint8 mask (255 = foreground).
     """
-    H, W = crop_bgr.shape[:2]
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
+    H, W = gray.shape[:2]
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Adaptive
-    block = 51 if 51 % 2 == 1 else 53
-    adap_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, block, 10)
-    adap = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, block, 10)
+    # Estimate background from interior (avoid the frame)
+    b = max(2, ignore_border_px)
+    inner = blur[b:H - b, b:W - b]
+    if inner.size == 0:
+        inner = blur
 
-    # Otsu
-    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    bg_med = np.median(inner)
+    # Robust noise estimate via MAD
+    mad = np.median(np.abs(inner - np.median(inner)))
+    sigma = 1.4826 * mad
+    # Threshold: at least 8 levels away from bg, or 0.6*sigma if larger
+    t = max(8.0, 0.6 * float(sigma))
 
-    # Canny edges (thickened)
-    v = np.median(blur)
+    diff = np.abs(blur.astype(np.float32) - float(bg_med))
+    fg1 = (diff >= t).astype(np.uint8) * 255
+
+    # Edges (dynamic thresholds), dilated a bit to thicken
+    v = float(np.median(inner))
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
     edges = cv2.Canny(blur, lower, upper)
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), 1)
 
-    # ΔE from interior background
-    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    bg_lab = _interior_median_lab(rgb, frac=0.06)  # (1,1,3)
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    dE = np.linalg.norm(lab - bg_lab, axis=2)
-    delta_mask = (dE >= deltaE_thresh).astype(np.uint8) * 255
+    mask = cv2.bitwise_or(fg1, edges)
 
-    # Union where white = foreground
-    mask = cv2.bitwise_or(adap_inv, otsu_inv)
-    mask = cv2.bitwise_or(mask, edges)
-    mask = cv2.bitwise_or(mask, adap)
-    mask = cv2.bitwise_or(mask, otsu)
-    mask = cv2.bitwise_or(mask, delta_mask)
-
-    # Strip inner band to avoid counting the framing box edges
-    b = max(2, int(border_strip_px))
+    # Strip inner band so the frame can't leak in
     mask[:b, :] = 0
     mask[-b:, :] = 0
     mask[:, :b] = 0
     mask[:, -b:] = 0
 
-    # Clean up
+    # Connect gaps and drop tiny blobs
     if dilate_px > 0:
         kernel = np.ones((dilate_px, dilate_px), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # Remove tiny blobs
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
     keep = np.zeros_like(mask)
     for i in range(1, num):
@@ -373,10 +345,9 @@ def crop_art_tight():
     Optional params (form or query):
       - border_strip_frac (float, default 0.02): inner band to ignore (avoid counting the frame)
       - min_area_frac (float, default 0.0003): drop tiny components below this fraction of crop area
-      - dilate_px (int, default 1): connect small gaps in the union mask
-      - pad_px (int, default 2): padding added after the tight bbox
-      - deltaE_thresh (float, default 10.0): Lab distance for bg-difference mask
-      - save_debug (0/1): if 1, saves the union mask used
+      - dilate_px (int, default 1): connect small gaps in the mask
+      - pad_px (int, default 2): padding added to final crop
+      - save_debug (0/1): if 1, saves the mask used
     """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
@@ -388,7 +359,6 @@ def crop_art_tight():
     min_area_frac = float(request.values.get("min_area_frac", 0.0003))
     dilate_px = int(request.values.get("dilate_px", 1))
     pad_px = int(request.values.get("pad_px", 2))
-    deltaE_thresh = float(request.values.get("deltaE_thresh", 10.0))
     save_debug = str(request.values.get("save_debug", "0")) == "1"
 
     try:
@@ -406,16 +376,17 @@ def crop_art_tight():
     for i, (x, y, w, h) in enumerate(boxes):
         crop = bgr[y:y + h, x:x + w].copy()
         Hc, Wc = crop.shape[:2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
 
         ignore_px = max(2, int(round(min(Hc, Wc) * border_strip_frac)))
         min_area = int(round(min_area_frac * Hc * Wc))
 
-        mask = _build_union_mask(
-            crop,
-            border_strip_px=ignore_px,
+        mask = _build_mask_bgdiff_and_edges(
+            gray,
+            ignore_border_px=ignore_px,
             min_area=min_area,
-            dilate_px=dilate_px,
-            deltaE_thresh=deltaE_thresh
+            dilate_px=dilate_px
         )
 
         x0r, y0r, x1r, y1r = _tight_bbox_from_mask(mask)
@@ -426,14 +397,14 @@ def crop_art_tight():
         x1 = min(Wc, x1r + pad_px)
         y1 = min(Hc, y1r + pad_px)
 
-        # Save tightly cropped **original pixels**
+        # Save tightly cropped ORIGINAL pixels
         tight = cv2_to_pil(crop[y0:y1, x0:x1])
         out_name = f"art_tight_{_ts()}_{i+1}.png"
         tight.save(os.path.join(STATIC_DIR, out_name), format="PNG")
 
         debug_urls = {}
         if DEBUG_SAVE and save_debug:
-            mname = f"dbg_unionmask_{_ts()}_{i+1}.png"
+            mname = f"dbg_mask_{_ts()}_{i+1}.png"
             cv2.imwrite(os.path.join(STATIC_DIR, mname), mask)
             debug_urls = {"mask_url": f"{request.host_url.rstrip('/')}/static/{mname}"}
 
@@ -448,7 +419,6 @@ def crop_art_tight():
                 "min_area_frac": min_area_frac,
                 "dilate_px": dilate_px,
                 "pad_px": pad_px,
-                "deltaE_thresh": deltaE_thresh,
                 "dpi": RENDER_DPI
             },
             **({"debug": debug_urls} if debug_urls else {})
