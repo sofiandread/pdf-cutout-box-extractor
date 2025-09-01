@@ -249,6 +249,64 @@ def detect_art_format():
 
     return jsonify(response), 200
 
+@app.route("/extract-art-no-box", methods=["POST"])
+def extract_art_no_box():
+    if 'pdf' not in request.files:
+        return jsonify({"error": "No file part 'pdf' in request"}), 400
+
+    f = request.files['pdf']
+    pdf_bytes = f.read()
+
+    try:
+        pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI).convert("RGBA")
+    except Exception as e:
+        return jsonify({"error": f"Failed to render PDF: {str(e)}"}), 400
+
+    bgr = pil_to_cv2(pil_img)
+    boxes = detect_design_boxes_bgr(bgr)
+    if not boxes:
+        return jsonify({"error": "No design box found"}), 404
+
+    results: List[Dict] = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        crop_rgba = pil_img.crop((x, y, x + w, y + h))
+        arr = np.array(crop_rgba)
+
+        # Work on RGB only
+        rgb = arr[:, :, :3].reshape(-1, 3)
+        # Find the most common color (likely the background box)
+        uniq, counts = np.unique(rgb, axis=0, return_counts=True)
+        bg_color = uniq[np.argmax(counts)]
+
+        # Create mask: mark background pixels
+        bg_mask = np.all(arr[:, :, :3] == bg_color, axis=-1)
+
+        # Set alpha=0 for background
+        arr[bg_mask, 3] = 0
+
+        # Convert back to PIL
+        art_only = Image.fromarray(arr, mode="RGBA")
+
+        # Save
+        out_name = f"art_no_box_{_ts()}_{i+1}.png"
+        out_path = os.path.join(STATIC_DIR, out_name)
+        art_only.save(out_path, format="PNG")
+
+        results.append({
+            "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
+            "x": int(x),
+            "y": int(y),
+            "width": int(w),
+            "height": int(h),
+            "page": 1
+        })
+
+    response = {
+        "art_no_box": results
+    }
+    return jsonify(response), 200
+
+
 
 @app.route('/static/<path:filename>')
 def static_files(filename):
