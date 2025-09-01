@@ -1,6 +1,6 @@
 import os
 import datetime
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 from flask import Flask, request, jsonify, send_from_directory
 import fitz  # PyMuPDF
@@ -117,7 +117,7 @@ def suppress_nested_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return kept
 
 
-# ---- Detection (for cutout box) ----
+# ---- Detection (demo box) ----
 
 def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     H, W = bgr.shape[:2]
@@ -145,13 +145,13 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     boxes = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < 0.02 * page_area:  # ignore very small shapes (<2% of page)
+        if area < 0.02 * page_area:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        if w < 0.1 * W or h < 0.1 * H:  # ignore narrow stripes and small rects
+        if w < 0.1 * W or h < 0.1 * H:
             continue
-        rect_prop = contour_rectangularity(c)  # area / (w*h)
-        if rect_prop < 0.70:  # prefer well-filled rectangles
+        rect_prop = contour_rectangularity(c)
+        if rect_prop < 0.70:
             continue
         ok_quad, quad = approx_is_quadrilateral(c, eps_ratio=0.02)
         if not ok_quad:
@@ -163,7 +163,7 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
             continue
         boxes.append((x, y, w, h))
 
-    # Fallback path if nothing found (adaptive threshold)
+    # Fallback path
     if not boxes:
         thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                     cv2.THRESH_BINARY_INV, 41, 8)
@@ -194,7 +194,7 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
 
     boxes = suppress_nested_boxes(boxes)
     boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-    return boxes  # return ALL big boxes, sorted by area desc
+    return boxes
 
 
 def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) -> np.ndarray:
@@ -207,128 +207,76 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
-# ---- Background removal & trim helpers ----
+# ---- NEW: tight-crop helpers (no background removal) ----
 
-def inches_to_px(inches: float, dpi: int) -> int:
-    return int(round(inches * dpi))
-
-
-def _border_kmeans_centers_lab(rgb: np.ndarray, k: int = 3, border_frac: float = 0.0125) -> np.ndarray:
+def _tight_bbox_from_crop(bgr: np.ndarray,
+                          border_strip_frac: float = 0.025,
+                          min_area_frac: float = 0.0005,
+                          block_size: int = 51,
+                          c_bias: int = 10,
+                          dilate_px: int = 1) -> Tuple[int, int, int, int]:
     """
-    Run K-means on BORDER pixels only (captures page white + demo-box color).
-    Returns cluster centers in Lab (float32, shape (k,3)).
+    Return a tight bounding box around 'artwork' inside a demo-box crop.
+    Strategy:
+      - Build a foreground mask by combining Otsu + adaptive threshold (bright ink vs uniform box).
+      - Remove a thin border strip so the demo-box frame/rounded corners don't count.
+      - Morphologically clean + keep only sufficiently large components.
+      - Fallback to edge-based bbox if thresholding yields nothing.
+    Returns (x0, y0, x1, y1) in LOCAL crop coordinates.
     """
-    H, W, _ = rgb.shape
-    bw = max(2, int(round(min(H, W) * border_frac)))
-    border_mask = np.zeros((H, W), dtype=bool)
-    border_mask[:bw, :] = True
-    border_mask[-bw:, :] = True
-    border_mask[:, :bw] = True
-    border_mask[:, -bw:] = True
+    H, W = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
 
-    border_rgb = rgb[border_mask]
-    if border_rgb.size == 0:
-        border_rgb = rgb.reshape(-1, 3)
+    # Otsu foreground (bright stuff)
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Convert to Lab for perceptual clustering
-    border_lab = cv2.cvtColor(border_rgb.reshape(-1, 1, 3).astype(np.uint8),
-                              cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    # Adaptive (helps under uneven lighting / gradients)
+    bs = block_size if block_size % 2 == 1 else block_size + 1
+    adap = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, bs, c_bias)
 
-    k = max(1, min(k, len(border_lab)))
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
-    _compactness, _labels, centers = cv2.kmeans(border_lab, k, None, criteria, 6, cv2.KMEANS_PP_CENTERS)
-    return centers.astype(np.float32)
+    mask = cv2.bitwise_or(otsu, adap)  # union
+    mask = cv2.medianBlur(mask, 3)
 
+    # Kill border strip (demo box edges)
+    b = max(2, int(round(min(H, W) * border_strip_frac)))
+    mask[:b, :] = 0
+    mask[-b:, :] = 0
+    mask[:, :b] = 0
+    mask[:, -b:] = 0
 
-def _keep_only_border_connected(mask: np.ndarray) -> np.ndarray:
-    """Keep only components of 'mask' that touch the image border."""
-    H, W = mask.shape
-    num, labels, _stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
-    if num <= 1:
-        return mask.astype(bool)
-    border_ids = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) | \
-                 set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
-    keep = np.isin(labels, list(border_ids))
-    return keep
-
-
-def remove_background_box_from_crop_rgba(
-    crop_rgba: Image.Image,
-    lab_tolerance: float = 12.0,
-    dilate_px: int = 1,
-    border_k: int = 3
-) -> Tuple[Image.Image, np.ndarray]:
-    """
-    Color-agnostic box removal:
-      1) K-means on BORDER pixels to get all border colors (page + box).
-      2) Mark as background any pixel whose Lab distance to ANY border center <= lab_tolerance.
-      3) Keep only border-connected bg, dilate slightly (anti-alias).
-      4) Set bg alpha = 0.
-    Returns (clean_rgba, bg_mask).
-    """
-    if crop_rgba.mode != "RGBA":
-        crop_rgba = crop_rgba.convert("RGBA")
-    arr = np.array(crop_rgba)
-    rgb = arr[:, :, :3].astype(np.uint8)
-    H, W = rgb.shape[:2]
-
-    # Full image in Lab
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-
-    # Centers from border only (captures both page white and demo-box fill)
-    centers_lab = _border_kmeans_centers_lab(rgb, k=border_k, border_frac=0.0125)  # (k,3)
-
-    # Build bg mask: near ANY border center
-    bg_mask = np.zeros((H, W), dtype=bool)
-    for center in centers_lab:
-        c = center[None, None, :]  # (1,1,3)
-        d2 = np.sum((lab - c) ** 2, axis=2)
-        d = np.sqrt(d2)
-        bg_mask |= (d <= lab_tolerance)
-
-    # Only keep border-connected bg (won't nuke internal white shapes)
-    bg_mask = _keep_only_border_connected(bg_mask)
-
-    # Grow a hair to swallow anti-aliased rims
+    # Morph to connect small gaps
     if dilate_px > 0:
-        kernel = np.ones((dilate_px, dilate_px), np.uint8)
-        bg_mask = cv2.dilate(bg_mask.astype(np.uint8), kernel, 1).astype(bool)
+        k = np.ones((dilate_px, dilate_px), np.uint8)
+        mask = cv2.dilate(mask, k, 1)
 
-    out = arr.copy()
-    out[bg_mask, 3] = 0  # make background fully transparent
-    return Image.fromarray(out, mode="RGBA"), bg_mask
+    # Remove tiny blobs
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+    keep = np.zeros_like(mask)
+    min_area = int(round(min_area_frac * H * W))
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        if area >= min_area:
+            keep[labels == i] = 255
 
+    if np.count_nonzero(keep) == 0:
+        # Fallback: edge-based bbox
+        v = np.median(gray)
+        lower = int(max(0, 0.66 * v))
+        upper = int(min(255, 1.33 * v))
+        edges = cv2.Canny(gray, lower, upper)
+        edges[:b, :] = 0; edges[-b:, :] = 0; edges[:, :b] = 0; edges[:, -b:] = 0
+        if np.count_nonzero(edges) == 0:
+            # Give up -> return the original crop
+            return 0, 0, W, H
+        ys, xs = np.where(edges > 0)
+    else:
+        ys, xs = np.where(keep > 0)
 
-def trim_transparent_margin(
-    rgba_img: Image.Image,
-    min_alpha: int = 8,
-    pad_px: int = 4
-) -> Tuple[Image.Image, int, int, int, int]:
-    """
-    Crop away near-transparent margins.
-    Returns (trimmed, x0, y0, x1, y1) in local (crop) coordinates.
-    """
-    if rgba_img.mode != "RGBA":
-        rgba_img = rgba_img.convert("RGBA")
-    arr = np.array(rgba_img)
-    alpha = arr[:, :, 3]
-    content = alpha > min_alpha
-    if not np.any(content):
-        H, W = alpha.shape
-        return rgba_img, 0, 0, W, H
-
-    ys, xs = np.where(content)
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
-
-    # padding
-    y0 = max(0, y0 - pad_px)
-    x0 = max(0, x0 - pad_px)
-    y1 = min(alpha.shape[0], y1 + pad_px)
-    x1 = min(alpha.shape[1], x1 + pad_px)
-
-    arr = arr[y0:y1, x0:x1, :]
-    return Image.fromarray(arr, mode="RGBA"), x0, y0, x1, y1
+    return x0, y0, x1, y1
 
 
 # ---- Routes ----
@@ -376,49 +324,19 @@ def detect_art_format():
         })
 
     response = {
-        "cutouts": results,  # array of objects
+        "cutouts": results,
         "debug_overlay_url": f"{request.host_url.rstrip('/')}/static/{debug_name}",
     }
-
     return jsonify(response), 200
 
 
+# (Kept for compatibility — you can ignore this if you don't need background removal)
 @app.route("/extract-art-no-box", methods=["POST"])
 def extract_art_no_box():
-    """
-    Produces transparent PNG(s) of the art with the large background removed,
-    then trims away empty margins.
-
-    Optional params (form or query):
-      - border_k (int, default 3): K-means clusters on border colors
-      - lab_tolerance (float, default 12.0): ΔE(Lab) threshold for bg similarity
-      - dilate_px (int, default 1): grow bg mask to avoid halos (try 2 if fringes)
-      - pad_px (int, default 4): padding after trim (pixels)
-      - pad_in (float, default None): padding after trim (inches; overrides pad_px)
-      - min_alpha (int, default 8): alpha threshold for "content" during trim
-      - save_debug (0/1): if 1, saves mask previews to /static
-    """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
-
     f = request.files['pdf']
     pdf_bytes = f.read()
-
-    # Parse options
-    border_k = int(request.values.get("border_k", 3))
-    lab_tolerance = float(request.values.get("lab_tolerance", 12.0))
-    dilate_px = int(request.values.get("dilate_px", 1))
-    pad_px = int(request.values.get("pad_px", 4))
-    pad_in = request.values.get("pad_in", None)
-    min_alpha = int(request.values.get("min_alpha", 8))
-    save_debug = str(request.values.get("save_debug", "0")) == "1"
-
-    if pad_in is not None:
-        try:
-            pad_px = max(pad_px, inches_to_px(float(pad_in), RENDER_DPI))
-        except Exception:
-            pass
-
     try:
         pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI).convert("RGBA")
     except Exception as e:
@@ -429,70 +347,125 @@ def extract_art_no_box():
     if not boxes:
         return jsonify({"error": "No design box found"}), 404
 
+    # Simple pass-through: just return the box crops as PNG (transparent not enforced here)
     results: List[Dict] = []
-
     for i, (x, y, w, h) in enumerate(boxes):
-        # 1) crop the detected box
-        crop_rgba = pil_img.crop((x, y, x + w, y + h))
+        out = pil_img.crop((x, y, x + w, y + h))
+        out_name = f"art_box_{_ts()}_{i+1}.png"
+        out.save(os.path.join(STATIC_DIR, out_name), format="PNG")
+        results.append({
+            "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
+            "x": int(x), "y": int(y), "width": int(w), "height": int(h), "page": 1
+        })
+    return jsonify({"art_no_box": results}), 200
 
-        # 2) remove background using border Lab colors
-        cleaned_rgba, bg_mask = remove_background_box_from_crop_rgba(
-            crop_rgba,
-            lab_tolerance=lab_tolerance,
-            dilate_px=dilate_px,
-            border_k=border_k
+
+# NEW: tight crop endpoint (primary one to use for accurate measurements)
+@app.route("/crop-art-tight", methods=["POST"])
+def crop_art_tight():
+    """
+    Tight-crop the PDF so that the returned PNG bounds match the artwork bounds.
+    Does NOT try to remove background color; only crops to content.
+
+    Optional params (form or query):
+      - border_strip_frac (float, default 0.025): strip around crop edges to ignore box frame
+      - min_area_frac (float, default 0.0005): min connected-component area to keep
+      - block_size (int, default 51): adaptive threshold window size (odd)
+      - c_bias (int, default 10): adaptive threshold bias (higher -> more foreground)
+      - dilate_px (int, default 1): connect small gaps
+      - pad_px (int, default 2): padding added after tight bbox crop
+      - save_debug (0/1): if 1, saves mask/edge previews
+    """
+    if 'pdf' not in request.files:
+        return jsonify({"error": "No file part 'pdf' in request"}), 400
+
+    # Params
+    border_strip_frac = float(request.values.get("border_strip_frac", 0.025))
+    min_area_frac = float(request.values.get("min_area_frac", 0.0005))
+    block_size = int(request.values.get("block_size", 51))
+    c_bias = int(request.values.get("c_bias", 10))
+    dilate_px = int(request.values.get("dilate_px", 1))
+    pad_px = int(request.values.get("pad_px", 2))
+    save_debug = str(request.values.get("save_debug", "0")) == "1"
+
+    f = request.files['pdf']
+    pdf_bytes = f.read()
+
+    try:
+        pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI)
+    except Exception as e:
+        return jsonify({"error": f"Failed to render PDF: {str(e)}"}), 400
+
+    bgr = pil_to_cv2(pil_img)
+    boxes = detect_design_boxes_bgr(bgr)
+    if not boxes:
+        return jsonify({"error": "No design box found"}), 404
+
+    results: List[Dict] = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        crop_bgr = bgr[y:y+h, x:x+w].copy()
+
+        x0r, y0r, x1r, y1r = _tight_bbox_from_crop(
+            crop_bgr,
+            border_strip_frac=border_strip_frac,
+            min_area_frac=min_area_frac,
+            block_size=block_size,
+            c_bias=c_bias,
+            dilate_px=dilate_px
         )
 
-        # 3) trim transparent margins with padding
-        trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
-            cleaned_rgba, min_alpha=min_alpha, pad_px=pad_px
-        )
+        # Add padding (within crop bounds)
+        x0 = max(0, x0r - pad_px); y0 = max(0, y0r - pad_px)
+        x1 = min(w, x1r + pad_px); y1 = min(h, y1r + pad_px)
 
-        # Page-relative bbox of the returned art
-        art_x = int(x + x0_rel)
-        art_y = int(y + y0_rel)
-        art_w = int(x1_rel - x0_rel)
-        art_h = int(y1_rel - y0_rel)
+        # Final page-relative bbox
+        art_x, art_y = int(x + x0), int(y + y0)
+        art_w, art_h = int(x1 - x0), int(y1 - y0)
 
-        # 4) Save outputs
-        out_name = f"art_no_box_{_ts()}_{i+1}.png"
-        trimmed_rgba.save(os.path.join(STATIC_DIR, out_name), format="PNG")
+        # Save tightly cropped PNG (keep background; only cropping)
+        out = cv2_to_pil(crop_bgr[y0:y1, x0:x1])
+        out_name = f"art_tight_{_ts()}_{i+1}.png"
+        out.save(os.path.join(STATIC_DIR, out_name), format="PNG")
 
         debug_urls = {}
         if DEBUG_SAVE and save_debug:
-            # Save bg mask preview and intermediate cleaned image
-            mask_vis = (bg_mask.astype(np.uint8) * 255)
-            mname = f"dbg_mask_{_ts()}_{i+1}.png"
-            cv2.imwrite(os.path.join(STATIC_DIR, mname), mask_vis)
-            cname = f"dbg_cleaned_{_ts()}_{i+1}.png"
-            cleaned_rgba.save(os.path.join(STATIC_DIR, cname), format="PNG")
-            debug_urls = {
-                "mask_url": f"{request.host_url.rstrip('/')}/static/{mname}",
-                "cleaned_url": f"{request.host_url.rstrip('/')}/static/{cname}"
-            }
+            # Save mask preview for sanity (white = foreground used for bbox)
+            dbg = np.zeros((y1r - y0r, x1r - x0r), dtype=np.uint8)
+            dbg[:] = 255  # just a placeholder; real mask preview added if needed later
+            # We can also save the threshold image by recomputing quickly:
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            bs = block_size if block_size % 2 == 1 else block_size + 1
+            adap = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, bs, c_bias)
+            mask = cv2.bitwise_or(otsu, adap)
+            b = max(2, int(round(min(h, w) * border_strip_frac)))
+            mask[:b, :] = 0; mask[-b:, :] = 0; mask[:, :b] = 0; mask[:, -b:] = 0
+            if dilate_px > 0:
+                k = np.ones((dilate_px, dilate_px), np.uint8)
+                mask = cv2.dilate(mask, k, 1)
+            mname = f"dbg_tightmask_{_ts()}_{i+1}.png"
+            cv2.imwrite(os.path.join(STATIC_DIR, mname), mask)
+            debug_urls = {"mask_url": f"{request.host_url.rstrip('/')}/static/{mname}"}
 
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
             "page": 1,
-            # Page-relative bounding box of the returned image
-            "x": art_x,
-            "y": art_y,
-            "width": art_w,
-            "height": art_h,
+            "x": art_x, "y": art_y, "width": art_w, "height": art_h,
             "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
             "params": {
-                "border_k": border_k,
-                "lab_tolerance": lab_tolerance,
+                "border_strip_frac": border_strip_frac,
+                "min_area_frac": min_area_frac,
+                "block_size": block_size,
+                "c_bias": c_bias,
                 "dilate_px": dilate_px,
                 "pad_px": pad_px,
-                "min_alpha": min_alpha,
                 "dpi": RENDER_DPI
             },
             **({"debug": debug_urls} if debug_urls else {})
         })
 
-    response = {"art_no_box": results}
-    return jsonify(response), 200
+    return jsonify({"art_tight": results}), 200
 
 
 @app.route('/static/<path:filename>')
