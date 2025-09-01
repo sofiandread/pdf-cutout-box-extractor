@@ -1,5 +1,4 @@
 import os
-import io
 import datetime
 from typing import List, Tuple, Dict, Optional
 
@@ -25,16 +24,26 @@ def _ts() -> str:
 
 
 def pil_to_cv2(im: Image.Image) -> np.ndarray:
+    """PIL RGB/RGBA -> OpenCV BGR/BGRA"""
     arr = np.array(im)
     if arr.ndim == 2:
         return arr
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    if arr.shape[2] == 3:
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    elif arr.shape[2] == 4:
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+    return arr
 
 
 def cv2_to_pil(arr: np.ndarray) -> Image.Image:
+    """OpenCV BGR/BGRA -> PIL RGB/RGBA"""
     if arr.ndim == 2:
         return Image.fromarray(arr)
-    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+    if arr.shape[2] == 3:
+        return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+    elif arr.shape[2] == 4:
+        return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGRA2RGBA))
+    return Image.fromarray(arr)
 
 
 def render_first_page_to_image(pdf_bytes: bytes, dpi: int = 300) -> Image.Image:
@@ -200,6 +209,10 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
 
 # ---- Background removal & trim helpers ----
 
+def inches_to_px(inches: float, dpi: int) -> int:
+    return int(round(inches * dpi))
+
+
 def _border_kmeans_centers_lab(rgb: np.ndarray, k: int = 3, border_frac: float = 0.0125) -> np.ndarray:
     """
     Run K-means on BORDER pixels only (captures page white + demo-box color).
@@ -208,28 +221,29 @@ def _border_kmeans_centers_lab(rgb: np.ndarray, k: int = 3, border_frac: float =
     H, W, _ = rgb.shape
     bw = max(2, int(round(min(H, W) * border_frac)))
     border_mask = np.zeros((H, W), dtype=bool)
-    border_mask[:bw, :] = True;  border_mask[-bw:, :] = True
-    border_mask[:, :bw] = True;  border_mask[:, -bw:] = True
+    border_mask[:bw, :] = True
+    border_mask[-bw:, :] = True
+    border_mask[:, :bw] = True
+    border_mask[:, -bw:] = True
 
     border_rgb = rgb[border_mask]
     if border_rgb.size == 0:
-        # Fallback: use whole image (shouldn't happen)
         border_rgb = rgb.reshape(-1, 3)
 
-    sample = border_rgb.astype(np.uint8).reshape(-1, 1, 3)
-    border_lab = cv2.cvtColor(sample, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    # Convert to Lab for perceptual clustering
+    border_lab = cv2.cvtColor(border_rgb.reshape(-1, 1, 3).astype(np.uint8),
+                              cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
 
-    # Clamp k to available samples
     k = max(1, min(k, len(border_lab)))
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
-    compactness, labels, centers = cv2.kmeans(border_lab, k, None, criteria, 6, cv2.KMEANS_PP_CENTERS)
+    _compactness, _labels, centers = cv2.kmeans(border_lab, k, None, criteria, 6, cv2.KMEANS_PP_CENTERS)
     return centers.astype(np.float32)
 
 
 def _keep_only_border_connected(mask: np.ndarray) -> np.ndarray:
     """Keep only components of 'mask' that touch the image border."""
     H, W = mask.shape
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
+    num, labels, _stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
     if num <= 1:
         return mask.astype(bool)
     border_ids = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) | \
@@ -284,11 +298,16 @@ def remove_background_box_from_crop_rgba(
     out[bg_mask, 3] = 0  # make background fully transparent
     return Image.fromarray(out, mode="RGBA"), bg_mask
 
+
 def trim_transparent_margin(
     rgba_img: Image.Image,
     min_alpha: int = 8,
     pad_px: int = 4
 ) -> Tuple[Image.Image, int, int, int, int]:
+    """
+    Crop away near-transparent margins.
+    Returns (trimmed, x0, y0, x1, y1) in local (crop) coordinates.
+    """
     if rgba_img.mode != "RGBA":
         rgba_img = rgba_img.convert("RGBA")
     arr = np.array(rgba_img)
@@ -302,13 +321,14 @@ def trim_transparent_margin(
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
 
-    y0 = max(0, y0 - pad_px); x0 = max(0, x0 - pad_px)
+    # padding
+    y0 = max(0, y0 - pad_px)
+    x0 = max(0, x0 - pad_px)
     y1 = min(alpha.shape[0], y1 + pad_px)
     x1 = min(alpha.shape[1], x1 + pad_px)
 
     arr = arr[y0:y1, x0:x1, :]
     return Image.fromarray(arr, mode="RGBA"), x0, y0, x1, y1
-
 
 
 # ---- Routes ----
@@ -337,17 +357,15 @@ def detect_art_format():
 
     overlay_bgr = draw_debug_overlay(bgr, boxes)
     debug_name = f"debug_{_ts()}.png"
-    debug_path = os.path.join(STATIC_DIR, debug_name)
     if DEBUG_SAVE:
-        cv2.imwrite(debug_path, overlay_bgr)
+        cv2.imwrite(os.path.join(STATIC_DIR, debug_name), overlay_bgr)
 
     results: List[Dict] = []
     for i, (x, y, w, h) in enumerate(boxes):
         crop = bgr[y:y + h, x:x + w]
         crop_img = cv2_to_pil(crop)
         crop_name = f"cutout_{_ts()}_{i+1}.png"
-        crop_path = os.path.join(STATIC_DIR, crop_name)
-        crop_img.save(crop_path, format="PNG")
+        crop_img.save(os.path.join(STATIC_DIR, crop_name), format="PNG")
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{crop_name}",
             "x": int(x),
@@ -372,10 +390,11 @@ def extract_art_no_box():
     then trims away empty margins.
 
     Optional params (form or query):
+      - border_k (int, default 3): K-means clusters on border colors
       - lab_tolerance (float, default 12.0): ΔE(Lab) threshold for bg similarity
       - dilate_px (int, default 1): grow bg mask to avoid halos (try 2 if fringes)
-      - pad_px (int, default 4): padding after trim
-      - pad_in (float, default None): inches of padding after trim (overrides pad_px)
+      - pad_px (int, default 4): padding after trim (pixels)
+      - pad_in (float, default None): padding after trim (inches; overrides pad_px)
       - min_alpha (int, default 8): alpha threshold for "content" during trim
       - save_debug (0/1): if 1, saves mask previews to /static
     """
@@ -386,6 +405,7 @@ def extract_art_no_box():
     pdf_bytes = f.read()
 
     # Parse options
+    border_k = int(request.values.get("border_k", 3))
     lab_tolerance = float(request.values.get("lab_tolerance", 12.0))
     dilate_px = int(request.values.get("dilate_px", 1))
     pad_px = int(request.values.get("pad_px", 4))
@@ -415,19 +435,18 @@ def extract_art_no_box():
         # 1) crop the detected box
         crop_rgba = pil_img.crop((x, y, x + w, y + h))
 
-        # 2) remove background using border Lab color
+        # 2) remove background using border Lab colors
         cleaned_rgba, bg_mask = remove_background_box_from_crop_rgba(
-    crop_rgba,
-    lab_tolerance=float(request.values.get("lab_tolerance", 12.0)),
-    dilate_px=int(request.values.get("dilate_px", 1)),
-    border_k=int(request.values.get("border_k", 3))
-)
+            crop_rgba,
+            lab_tolerance=lab_tolerance,
+            dilate_px=dilate_px,
+            border_k=border_k
+        )
 
-trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
-    cleaned_rgba,
-    min_alpha=int(request.values.get("min_alpha", 8)),
-    pad_px=int(request.values.get("pad_px", 4))
-)
+        # 3) trim transparent margins with padding
+        trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
+            cleaned_rgba, min_alpha=min_alpha, pad_px=pad_px
+        )
 
         # Page-relative bbox of the returned art
         art_x = int(x + x0_rel)
@@ -437,20 +456,16 @@ trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
 
         # 4) Save outputs
         out_name = f"art_no_box_{_ts()}_{i+1}.png"
-        out_path = os.path.join(STATIC_DIR, out_name)
-        trimmed_rgba.save(out_path, format="PNG")
+        trimmed_rgba.save(os.path.join(STATIC_DIR, out_name), format="PNG")
 
         debug_urls = {}
         if DEBUG_SAVE and save_debug:
             # Save bg mask preview and intermediate cleaned image
             mask_vis = (bg_mask.astype(np.uint8) * 255)
-            mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
             mname = f"dbg_mask_{_ts()}_{i+1}.png"
-            mp = os.path.join(STATIC_DIR, mname)
-            cv2.imwrite(mp, mask_vis)
+            cv2.imwrite(os.path.join(STATIC_DIR, mname), mask_vis)
             cname = f"dbg_cleaned_{_ts()}_{i+1}.png"
-            cp = os.path.join(STATIC_DIR, cname)
-            cleaned_rgba.save(cp, format="PNG")
+            cleaned_rgba.save(os.path.join(STATIC_DIR, cname), format="PNG")
             debug_urls = {
                 "mask_url": f"{request.host_url.rstrip('/')}/static/{mname}",
                 "cleaned_url": f"{request.host_url.rstrip('/')}/static/{cname}"
@@ -466,6 +481,7 @@ trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
             "height": art_h,
             "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
             "params": {
+                "border_k": border_k,
                 "lab_tolerance": lab_tolerance,
                 "dilate_px": dilate_px,
                 "pad_px": pad_px,
