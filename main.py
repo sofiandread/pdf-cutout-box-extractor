@@ -1,7 +1,7 @@
 import os
 import io
 import datetime
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 from flask import Flask, request, jsonify, send_from_directory
 import fitz  # PyMuPDF
@@ -25,6 +25,7 @@ def _ts() -> str:
 
 
 def pil_to_cv2(im: Image.Image) -> np.ndarray:
+    """PIL RGB -> OpenCV BGR (keeps 3 channels)"""
     arr = np.array(im)
     if arr.ndim == 2:
         return arr
@@ -32,6 +33,7 @@ def pil_to_cv2(im: Image.Image) -> np.ndarray:
 
 
 def cv2_to_pil(arr: np.ndarray) -> Image.Image:
+    """OpenCV BGR -> PIL RGB"""
     if arr.ndim == 2:
         return Image.fromarray(arr)
     return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
@@ -108,7 +110,7 @@ def suppress_nested_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return kept
 
 
-# ---- Detection ----
+# ---- Detection (for cutout box) ----
 
 def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     H, W = bgr.shape[:2]
@@ -198,6 +200,175 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
+# ---- Helpers for background removal and trimming ----
+
+def inches_to_px(inches: float, dpi: int) -> int:
+    return int(round(inches * dpi))
+
+
+def _kmeans_centers_lab(rgb: np.ndarray, k: int = 3, sample_step: int = 4) -> np.ndarray:
+    """
+    Fast color clustering using OpenCV kmeans (no sklearn).
+    Returns cluster centers in LAB (float32, shape (k,3)).
+    """
+    h, w, _ = rgb.shape
+    # Subsample to speed up
+    sampled = rgb[::sample_step, ::sample_step, :].reshape(-1, 3).astype(np.float32)
+    if sampled.shape[0] < k:
+        k = max(1, sampled.shape[0])
+    # Convert to LAB for perceptual distance
+    sampled_lab = cv2.cvtColor(sampled.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+    compactness, labels, centers = cv2.kmeans(sampled_lab, k, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
+    return centers.astype(np.float32)
+
+
+def _label_by_nearest_center_lab(lab_img: np.ndarray, centers_lab: np.ndarray) -> np.ndarray:
+    """
+    Assign each pixel the index of the nearest LAB center. Returns label image (H,W).
+    """
+    # lab_img: HxWx3 float32
+    H, W, _ = lab_img.shape
+    C = centers_lab.shape[0]
+    # Compute squared distance to each center efficiently
+    lab_ = lab_img.reshape(-1, 3)[:, None, :]  # (N,1,3)
+    centers_ = centers_lab[None, :, :]         # (1,C,3)
+    d2 = np.sum((lab_ - centers_) ** 2, axis=2)  # (N,C)
+    labels = np.argmin(d2, axis=1).astype(np.int32)
+    return labels.reshape(H, W)
+
+
+def _find_background_centers_from_border(labels: np.ndarray, centers_lab: np.ndarray, border_frac_thresh: float = 0.15) -> List[int]:
+    """
+    Identify which clusters are background by checking which labels dominate on the border.
+    """
+    H, W = labels.shape
+    bw = max(2, min(H, W) // 100)  # thin border strip ~1%
+    border_mask = np.zeros_like(labels, dtype=bool)
+    border_mask[:bw, :] = True
+    border_mask[-bw:, :] = True
+    border_mask[:, :bw] = True
+    border_mask[:, -bw:] = True
+
+    border_labels = labels[border_mask]
+    bg_labels, counts = np.unique(border_labels, return_counts=True)
+
+    # Choose any cluster that covers >= border_frac_thresh of border pixels
+    total = border_labels.size
+    bg = [int(l) for l, c in zip(bg_labels, counts) if c / float(total) >= border_frac_thresh]
+    # Fallback: at least take the most common border label
+    if not bg and bg_labels.size > 0:
+        bg = [int(bg_labels[np.argmax(counts)])]
+    return bg
+
+
+def _keep_only_border_connected(mask: np.ndarray) -> np.ndarray:
+    """
+    Keep only the components of 'mask' that touch the image border.
+    """
+    H, W = mask.shape
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
+    if num <= 1:
+        return mask.astype(bool)
+
+    border_touching = set()
+    # Any component ID that appears on the border?
+    border_ids = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) | \
+                 set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+    border_touching |= border_ids
+
+    keep = np.isin(labels, list(border_touching))
+    return keep
+
+
+def remove_background_box_from_crop_rgba(
+    crop_rgba: Image.Image,
+    lab_tolerance: float = 12.0,
+    k_colors: int = 3,
+    dilate_px: int = 1
+) -> Tuple[Image.Image, np.ndarray]:
+    """
+    Remove the large background (demo box + any page white corners) from a crop.
+    - Uses color clustering in LAB, labels the whole image by nearest centers.
+    - Marks clusters that dominate the border as background.
+    - Optionally dilates the bg mask to clean anti-aliased edges.
+    Returns (clean_rgba_image, bg_mask_bool_array)
+    """
+    if crop_rgba.mode != "RGBA":
+        crop_rgba = crop_rgba.convert("RGBA")
+    arr = np.array(crop_rgba)
+    rgb = arr[:, :, :3]
+    H, W = rgb.shape[:2]
+
+    # Full LAB image (float32)
+    lab = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    # Cluster colors (centers in LAB)
+    centers_lab = _kmeans_centers_lab(rgb, k=k_colors, sample_step=max(1, min(H, W) // 400 or 1))
+
+    # Label each pixel by nearest center
+    labels = _label_by_nearest_center_lab(lab, centers_lab)
+
+    # Background centers determined from border dominance
+    bg_centers = _find_background_centers_from_border(labels, centers_lab, border_frac_thresh=0.10)
+
+    # Build background candidate mask by LAB distance to each bg center
+    bg_mask = np.zeros((H, W), dtype=bool)
+    for idx in bg_centers:
+        center = centers_lab[idx][None, None, :]  # (1,1,3)
+        d2 = np.sum((lab - center) ** 2, axis=2)
+        bg_mask |= (np.sqrt(d2) <= lab_tolerance)
+
+    # Keep only border-connected bg (avoid nuking internal shapes similar to bg color)
+    bg_mask = _keep_only_border_connected(bg_mask)
+
+    # Slightly grow mask to swallow anti-aliased edges
+    if dilate_px > 0:
+        kernel = np.ones((dilate_px, dilate_px), np.uint8)
+        bg_mask = cv2.dilate(bg_mask.astype(np.uint8), kernel, 1).astype(bool)
+
+    # Apply transparency
+    out = arr.copy()
+    out[bg_mask, 3] = 0
+
+    return Image.fromarray(out, mode="RGBA"), bg_mask
+
+
+def trim_transparent_margin(
+    rgba_img: Image.Image,
+    min_alpha: int = 8,
+    pad_px: int = 4
+) -> Tuple[Image.Image, int, int, int, int]:
+    """
+    Crops away near-transparent margins.
+    Returns (trimmed_image, x0, y0, x1, y1) where x0,y0.. are coordinates within the input image.
+    """
+    if rgba_img.mode != "RGBA":
+        rgba_img = rgba_img.convert("RGBA")
+    arr = np.array(rgba_img)
+    alpha = arr[:, :, 3]
+    content = alpha > min_alpha
+    if not np.any(content):
+        H, W = alpha.shape
+        return rgba_img, 0, 0, W, H
+
+    ys, xs = np.where(content)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+
+    # padding
+    y0 = max(0, y0 - pad_px)
+    x0 = max(0, x0 - pad_px)
+    y1 = min(alpha.shape[0], y1 + pad_px)
+    x1 = min(alpha.shape[1], x1 + pad_px)
+
+    arr = arr[y0:y1, x0:x1, :]
+    return Image.fromarray(arr, mode="RGBA"), x0, y0, x1, y1
+
+
+# ---- Routes ----
+
 @app.route("/")
 def root():
     return jsonify({"status": "ok", "message": "PDF cutout box extractor is running"})
@@ -249,13 +420,39 @@ def detect_art_format():
 
     return jsonify(response), 200
 
+
 @app.route("/extract-art-no-box", methods=["POST"])
 def extract_art_no_box():
+    """
+    Produces transparent PNG(s) of the art with the large background removed,
+    and trims away empty margins.
+
+    Query/body params you can pass (optional):
+      - k_colors (int, default 3): number of color clusters
+      - lab_tolerance (float, default 12.0): LAB distance threshold for bg
+      - dilate_px (int, default 1): grow bg mask to avoid halos
+      - pad_px (int, default 4): pixels of padding after trim
+      - pad_in (float, default None): inches of padding after trim (overrides pad_px if set)
+      - min_alpha (int, default 8): alpha threshold for "empty"
+    """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
 
     f = request.files['pdf']
     pdf_bytes = f.read()
+
+    # Parse options
+    k_colors = int(request.values.get("k_colors", 3))
+    lab_tolerance = float(request.values.get("lab_tolerance", 12.0))
+    dilate_px = int(request.values.get("dilate_px", 1))
+    pad_px = int(request.values.get("pad_px", 4))
+    pad_in = request.values.get("pad_in", None)
+    min_alpha = int(request.values.get("min_alpha", 8))
+    if pad_in is not None:
+        try:
+            pad_px = max(pad_px, inches_to_px(float(pad_in), RENDER_DPI))
+        except Exception:
+            pass
 
     try:
         pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI).convert("RGBA")
@@ -268,44 +465,57 @@ def extract_art_no_box():
         return jsonify({"error": "No design box found"}), 404
 
     results: List[Dict] = []
+
     for i, (x, y, w, h) in enumerate(boxes):
+        # 1) crop the detected box
         crop_rgba = pil_img.crop((x, y, x + w, y + h))
-        arr = np.array(crop_rgba)
 
-        # Work on RGB only
-        rgb = arr[:, :, :3].reshape(-1, 3)
-        # Find the most common color (likely the background box)
-        uniq, counts = np.unique(rgb, axis=0, return_counts=True)
-        bg_color = uniq[np.argmax(counts)]
+        # 2) remove background (color-agnostic) and clean edges
+        cleaned_rgba, bg_mask = remove_background_box_from_crop_rgba(
+            crop_rgba,
+            lab_tolerance=lab_tolerance,
+            k_colors=k_colors,
+            dilate_px=dilate_px
+        )
 
-        # Create mask: mark background pixels
-        bg_mask = np.all(arr[:, :, :3] == bg_color, axis=-1)
+        # 3) trim transparent margins with padding
+        trimmed_rgba, x0_rel, y0_rel, x1_rel, y1_rel = trim_transparent_margin(
+            cleaned_rgba, min_alpha=min_alpha, pad_px=pad_px
+        )
 
-        # Set alpha=0 for background
-        arr[bg_mask, 3] = 0
+        # Page-relative bbox of trimmed art
+        art_x = int(x + x0_rel)
+        art_y = int(y + y0_rel)
+        art_w = int(x1_rel - x0_rel)
+        art_h = int(y1_rel - y0_rel)
 
-        # Convert back to PIL
-        art_only = Image.fromarray(arr, mode="RGBA")
-
-        # Save
+        # 4) Save
         out_name = f"art_no_box_{_ts()}_{i+1}.png"
         out_path = os.path.join(STATIC_DIR, out_name)
-        art_only.save(out_path, format="PNG")
+        trimmed_rgba.save(out_path, format="PNG")
 
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{out_name}",
-            "x": int(x),
-            "y": int(y),
-            "width": int(w),
-            "height": int(h),
-            "page": 1
+            "page": 1,
+            # Page-relative bounding box of the returned image
+            "x": art_x,
+            "y": art_y,
+            "width": art_w,
+            "height": art_h,
+            # Extra info (optional; useful for debugging)
+            "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
+            "params": {
+                "k_colors": k_colors,
+                "lab_tolerance": lab_tolerance,
+                "dilate_px": dilate_px,
+                "pad_px": pad_px,
+                "min_alpha": min_alpha,
+                "dpi": RENDER_DPI
+            }
         })
 
-    response = {
-        "art_no_box": results
-    }
+    response = {"art_no_box": results}
     return jsonify(response), 200
-
 
 
 @app.route('/static/<path:filename>')
