@@ -1,3 +1,4 @@
+# main.py — PDF demo-box detect + tight crop (PNG) + tight crop (SVG)
 import os
 import datetime
 from typing import List, Tuple, Dict
@@ -22,6 +23,7 @@ def _ts() -> str:
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+# ---------- Image conversions ----------
 def pil_to_cv2(im: Image.Image) -> np.ndarray:
     arr = np.array(im)
     if arr.ndim == 2:
@@ -56,8 +58,7 @@ def render_first_page_to_image(pdf_bytes: bytes, dpi: int = 300) -> Image.Image:
     return img
 
 
-# ---- Geometry helpers ----
-
+# ---------- Geometry helpers ----------
 def contour_rectangularity(cnt: np.ndarray) -> float:
     area = cv2.contourArea(cnt)
     x, y, w, h = cv2.boundingRect(cnt)
@@ -113,19 +114,21 @@ def suppress_nested_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[
     return kept
 
 
-# ---- Detect the big demo box ----
-
+# ---------- Demo-box detection ----------
 def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     H, W = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    v = np.median(blur)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    v = np.median(gray_blur)
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
-    edges = cv2.Canny(blur, lower, upper)
+    edges = cv2.Canny(gray_blur, lower, upper)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     page_area = W * H
@@ -177,6 +180,7 @@ def detect_design_boxes_bgr(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
 
     if not boxes:
         return []
+
     boxes = suppress_nested_boxes(boxes)
     boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
     return boxes
@@ -192,14 +196,13 @@ def draw_debug_overlay(bgr: np.ndarray, boxes: List[Tuple[int, int, int, int]]) 
     return overlay
 
 
-# ---- Tight-crop logic (NO color changes) ----
-
+# ---------- Tight-crop mask (background-agnostic, NO color edits) ----------
 def _build_mask_bgdiff_and_edges(gray: np.ndarray,
                                  ignore_border_px: int,
                                  min_area: int,
                                  dilate_px: int = 1) -> np.ndarray:
     """
-    Foreground = pixels whose brightness differs from the interior background,
+    Foreground = pixels whose brightness differs from interior background (robust threshold)
     OR strong edges. Returns uint8 mask (255 = foreground).
     """
     H, W = gray.shape[:2]
@@ -211,17 +214,15 @@ def _build_mask_bgdiff_and_edges(gray: np.ndarray,
     if inner.size == 0:
         inner = blur
 
-    bg_med = np.median(inner)
-    # Robust noise estimate via MAD
-    mad = np.median(np.abs(inner - np.median(inner)))
+    bg_med = float(np.median(inner))
+    mad = float(np.median(np.abs(inner - np.median(inner))))
     sigma = 1.4826 * mad
-    # Threshold: at least 8 levels away from bg, or 0.6*sigma if larger
-    t = max(8.0, 0.6 * float(sigma))
+    t = max(8.0, 0.6 * sigma)  # robust threshold
 
-    diff = np.abs(blur.astype(np.float32) - float(bg_med))
+    diff = np.abs(blur.astype(np.float32) - bg_med)
     fg1 = (diff >= t).astype(np.uint8) * 255
 
-    # Edges (dynamic thresholds), dilated a bit to thicken
+    # Edges
     v = float(np.median(inner))
     lower = int(max(0, 0.66 * v))
     upper = int(min(255, 1.33 * v))
@@ -230,7 +231,7 @@ def _build_mask_bgdiff_and_edges(gray: np.ndarray,
 
     mask = cv2.bitwise_or(fg1, edges)
 
-    # Strip inner band so the frame can't leak in
+    # Strip inner band so frame doesn't leak
     mask[:b, :] = 0
     mask[-b:, :] = 0
     mask[:, :b] = 0
@@ -261,15 +262,15 @@ def _tight_bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
     return x0, y0, x1, y1
 
 
-# ---- Routes ----
-
+# ---------- Routes ----------
 @app.route("/")
 def root():
-    return jsonify({"status": "ok", "message": "PDF cutout box extractor is running"})
+    return jsonify({"status": "ok", "message": "PDF cutout service running"})
 
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
+    # POST form-data: pdf=<file>
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
 
@@ -297,7 +298,11 @@ def detect_art_format():
         crop_img.save(os.path.join(STATIC_DIR, crop_name), format="PNG")
         results.append({
             "url": f"{request.host_url.rstrip('/')}/static/{crop_name}",
-            "x": int(x), "y": int(y), "width": int(w), "height": int(h), "page": 1
+            "x": int(x),
+            "y": int(y),
+            "width": int(w),
+            "height": int(h),
+            "page": 1
         })
 
     return jsonify({
@@ -306,7 +311,6 @@ def detect_art_format():
     }), 200
 
 
-# Simple pass-through (kept for compatibility)
 @app.route("/extract-art-no-box", methods=["POST"])
 def extract_art_no_box():
     if 'pdf' not in request.files:
@@ -335,31 +339,30 @@ def extract_art_no_box():
     return jsonify({"art_no_box": results}), 200
 
 
-# NEW: tight crop endpoint (primary)
 @app.route("/crop-art-tight", methods=["POST"])
 def crop_art_tight():
     """
-    Tight-crop to the minimal rectangle enclosing all visible artwork inside the big demo box.
-    NO color edits; only cropping.
+    Tight-crop to the minimal rectangle enclosing the art inside the detected demo box.
+    No color edits, only cropping.
 
     Optional params (form or query):
-      - border_strip_frac (float, default 0.02): inner band to ignore (avoid counting the frame)
-      - min_area_frac (float, default 0.0003): drop tiny components below this fraction of crop area
-      - dilate_px (int, default 1): connect small gaps in the mask
-      - pad_px (int, default 2): padding added to final crop
-      - save_debug (0/1): if 1, saves the mask used
+      - border_strip_frac (float, default 0.02)
+      - min_area_frac (float, default 0.0003)
+      - dilate_px (int, default 1)
+      - pad_px (int, default 2)
+      - save_debug (0/1)
     """
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part 'pdf' in request"}), 400
-
-    f = request.files['pdf']
-    pdf_bytes = f.read()
 
     border_strip_frac = float(request.values.get("border_strip_frac", 0.02))
     min_area_frac = float(request.values.get("min_area_frac", 0.0003))
     dilate_px = int(request.values.get("dilate_px", 1))
     pad_px = int(request.values.get("pad_px", 2))
     save_debug = str(request.values.get("save_debug", "0")) == "1"
+
+    f = request.files['pdf']
+    pdf_bytes = f.read()
 
     try:
         pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI)
@@ -372,7 +375,6 @@ def crop_art_tight():
         return jsonify({"error": "No design box found"}), 404
 
     results: List[Dict] = []
-
     for i, (x, y, w, h) in enumerate(boxes):
         crop = bgr[y:y + h, x:x + w].copy()
         Hc, Wc = crop.shape[:2]
@@ -383,10 +385,7 @@ def crop_art_tight():
         min_area = int(round(min_area_frac * Hc * Wc))
 
         mask = _build_mask_bgdiff_and_edges(
-            gray,
-            ignore_border_px=ignore_px,
-            min_area=min_area,
-            dilate_px=dilate_px
+            gray, ignore_border_px=ignore_px, min_area=min_area, dilate_px=dilate_px
         )
 
         x0r, y0r, x1r, y1r = _tight_bbox_from_mask(mask)
@@ -397,7 +396,6 @@ def crop_art_tight():
         x1 = min(Wc, x1r + pad_px)
         y1 = min(Hc, y1r + pad_px)
 
-        # Save tightly cropped ORIGINAL pixels
         tight = cv2_to_pil(crop[y0:y1, x0:x1])
         out_name = f"art_tight_{_ts()}_{i+1}.png"
         tight.save(os.path.join(STATIC_DIR, out_name), format="PNG")
@@ -425,6 +423,133 @@ def crop_art_tight():
         })
 
     return jsonify({"art_tight": results}), 200
+
+
+@app.route("/crop-art-tight-svg", methods=["POST"])
+def crop_art_tight_svg():
+    """
+    Same tight crop as /crop-art-tight, but returns SVGs (keeps vectors when present).
+    Pure PyMuPDF — no external API.
+
+    Optional params (form or query): same as /crop-art-tight, plus:
+      - raster_fallback (0/1): if 1, wrap a PNG in an SVG when vector export fails
+    """
+    if 'pdf' not in request.files:
+        return jsonify({"error": "No file part 'pdf' in request"}), 400
+
+    border_strip_frac = float(request.values.get("border_strip_frac", 0.02))
+    min_area_frac = float(request.values.get("min_area_frac", 0.0003))
+    dilate_px = int(request.values.get("dilate_px", 1))
+    pad_px = int(request.values.get("pad_px", 2))
+    save_debug = str(request.values.get("save_debug", "0")) == "1"
+    raster_fallback = str(request.values.get("raster_fallback", "0")) == "1"
+
+    f = request.files['pdf']
+    pdf_bytes = f.read()
+
+    # Render once to find boxes (pixel space @ RENDER_DPI)
+    try:
+        pil_img = render_first_page_to_image(pdf_bytes, dpi=RENDER_DPI)
+    except Exception as e:
+        return jsonify({"error": f"Failed to render PDF: {str(e)}"}), 400
+
+    bgr = pil_to_cv2(pil_img)
+    boxes = detect_design_boxes_bgr(bgr)
+    if not boxes:
+        return jsonify({"error": "No design box found"}), 404
+
+    # Open PDF for page-space (points @72dpi)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    px_to_pt = 72.0 / float(RENDER_DPI)
+
+    results: List[Dict] = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        crop = bgr[y:y + h, x:x + w].copy()
+        Hc, Wc = crop.shape[:2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+
+        ignore_px = max(2, int(round(min(Hc, Wc) * border_strip_frac)))
+        min_area = int(round(min_area_frac * Hc * Wc))
+        mask = _build_mask_bgdiff_and_edges(
+            gray, ignore_border_px=ignore_px, min_area=min_area, dilate_px=dilate_px
+        )
+        x0r, y0r, x1r, y1r = _tight_bbox_from_mask(mask)
+
+        # padding in pixels (crop space)
+        x0 = max(0, x0r - pad_px)
+        y0 = max(0, y0r - pad_px)
+        x1 = min(Wc, x1r + pad_px)
+        y1 = min(Hc, y1r + pad_px)
+
+        # Convert to page points
+        gx0 = (x + x0) * px_to_pt
+        gy0 = (y + y0) * px_to_pt
+        gx1 = (x + x1) * px_to_pt
+        gy1 = (y + y1) * px_to_pt
+        clip_rect = fitz.Rect(gx0, gy0, gx1, gy1)
+
+        svg_bytes = None
+        # Try the most vector-preserving paths first
+        try:
+            dl = page.get_displaylist(clip=clip_rect)
+            svg_bytes = dl.get_svg_image()  # bytes
+        except Exception:
+            try:
+                svg_text = page.get_svg_image(clip=clip_rect)
+                svg_bytes = svg_text if isinstance(svg_text, (bytes, bytearray)) else str(svg_text).encode("utf-8")
+            except Exception:
+                try:
+                    svg_text = page.get_text("svg", clip=clip_rect)
+                    svg_bytes = svg_text.encode("utf-8")
+                except Exception:
+                    svg_bytes = None
+
+        if svg_bytes is None and raster_fallback:
+            # Fallback: render just the clip to PNG and wrap inside a minimal SVG
+            mat = fitz.Matrix(RENDER_DPI / 72.0, RENDER_DPI / 72.0)
+            pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
+            png_name = f"fallback_{_ts()}_{i+1}.png"
+            png_path = os.path.join(STATIC_DIR, png_name)
+            pix.save(png_path)
+            w_px, h_px = pix.width, pix.height
+            svg_bytes = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{w_px}" height="{h_px}" viewBox="0 0 {w_px} {h_px}">'
+                f'<image href="{png_name}" x="0" y="0" width="{w_px}" height="{h_px}" /></svg>'
+            ).encode("utf-8")
+
+        if svg_bytes is None:
+            return jsonify({"error": "SVG export failed; try raster_fallback=1"}), 500
+
+        out_name = f"art_tight_{_ts()}_{i+1}.svg"
+        out_path = os.path.join(STATIC_DIR, out_name)
+        with open(out_path, "wb") as fh:
+            fh.write(svg_bytes)
+
+        debug_urls = {}
+        if DEBUG_SAVE and save_debug:
+            mname = f"dbg_mask_svg_{_ts()}_{i+1}.png"
+            cv2.imwrite(os.path.join(STATIC_DIR, mname), mask)
+            debug_urls = {"mask_url": f"{request.host_url.rstrip('/')}/static/{mname}"}
+
+        results.append({
+            "svg_url": f"{request.host_url.rstrip('/')}/static/{out_name}",
+            "page": 1,
+            "x": int((gx0) / px_to_pt), "y": int((gy0) / px_to_pt),
+            "width": int((gx1 - gx0) / px_to_pt), "height": int((gy1 - gy0) / px_to_pt),
+            "detected_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
+            "params": {
+                "border_strip_frac": border_strip_frac,
+                "min_area_frac": min_area_frac,
+                "dilate_px": dilate_px,
+                "pad_px": pad_px,
+                "dpi": RENDER_DPI
+            },
+            **({"debug": debug_urls} if debug_urls else {})
+        })
+
+    return jsonify({"art_tight_svg": results}), 200
 
 
 @app.route('/static/<path:filename>')
